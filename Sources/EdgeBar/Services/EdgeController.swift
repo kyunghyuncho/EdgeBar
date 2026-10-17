@@ -2,10 +2,10 @@ import AppKit
 import ApplicationServices
 import Foundation
 
-@_silgen_name("_AXUIElementGetWindow")
-func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
-
-/// Launches Edge profiles via the Mach-O binary and focuses existing windows via Accessibility.
+/// Launches Edge profiles via the Mach-O binary and focuses existing windows.
+///
+/// Primary focusing uses Microsoft Edge's AppleScript dictionary (no Accessibility required).
+/// Accessibility remains a secondary path for binding the focused AX window when trusted.
 @MainActor
 final class EdgeController: ObservableObject {
     static let shared = EdgeController()
@@ -13,10 +13,19 @@ final class EdgeController: ObservableObject {
     static let edgeBundleID = "com.microsoft.edgemac"
     static let edgeBinaryPath = "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"
 
-    /// In-memory map of CGWindowID → profile directory name.
-    private var windowBindings: [CGWindowID: String] = [:]
-    /// Most recently focused/raised window per profile directory.
-    private var lastWindowByProfile: [String: CGWindowID] = [:]
+    private struct ScriptedWindow {
+        let id: String
+        let index: Int
+        let name: String
+        let tabTitle: String
+
+        var haystack: String { "\(name)\n\(tabTitle)" }
+    }
+
+    /// Edge AppleScript window id → profile directory name.
+    private var windowBindings: [String: String] = [:]
+    /// Most recently raised/focused Edge window id per profile directory.
+    private var lastWindowByProfile: [String: String] = [:]
     @Published private(set) var activeProfileDirectory: String?
 
     init() {
@@ -41,8 +50,7 @@ final class EdgeController: ObservableObject {
             return
         }
 
-        if !forceNewWindow, let window = findWindow(for: profile) {
-            raise(window: window, profile: profile)
+        if !forceNewWindow, raiseExistingWindow(for: profile) {
             return
         }
 
@@ -62,13 +70,22 @@ final class EdgeController: ObservableObject {
     }
 
     func bindFrontmostEdgeWindow(to profile: EdgeProfile) {
-        guard let edgeApp = edgeRunningApp() else { return }
-        let appElement = AXUIElementCreateApplication(edgeApp.processIdentifier)
-        guard let focused = copyAXElement(appElement, kAXFocusedWindowAttribute),
-              let windowID = windowID(of: focused)
+        if let front = listScriptedWindows().first {
+            bind(windowID: front.id, to: profile.directoryName)
+            _ = raiseScriptedWindow(id: front.id)
+            activeProfileDirectory = profile.directoryName
+            return
+        }
+
+        guard isAccessibilityTrusted,
+              let edgeApp = edgeRunningApp()
         else { return }
-        bind(windowID: windowID, to: profile.directoryName)
-        raise(window: focused, profile: profile)
+        let appElement = AXUIElementCreateApplication(edgeApp.processIdentifier)
+        guard let focused = copyAXElement(appElement, kAXFocusedWindowAttribute) else { return }
+        // Best-effort: still activate Edge even if we cannot map an AppleScript id.
+        edgeApp.activate()
+        AXUIElementPerformAction(focused, kAXRaiseAction as CFString)
+        activeProfileDirectory = profile.directoryName
     }
 
     func refreshActiveProfile(from profiles: [EdgeProfile]) {
@@ -76,37 +93,218 @@ final class EdgeController: ObservableObject {
             activeProfileDirectory = nil
             return
         }
-        let appElement = AXUIElementCreateApplication(edgeApp.processIdentifier)
-        guard let focused = copyAXElement(appElement, kAXFocusedWindowAttribute) else {
+
+        let windows = listScriptedWindows()
+        pruneStaleBindings(liveIDs: Set(windows.map(\.id)))
+
+        guard let front = windows.first else {
             activeProfileDirectory = nil
             return
         }
 
-        pruneStaleBindings()
-
-        if let id = windowID(of: focused), let dir = windowBindings[id] {
-            lastWindowByProfile[dir] = id
+        if let dir = windowBindings[front.id] {
+            lastWindowByProfile[dir] = front.id
             activeProfileDirectory = dir
             persistBindings()
             return
         }
 
-        if let match = identifyProfile(of: focused, profiles: profiles) {
-            if let id = windowID(of: focused) {
-                bind(windowID: id, to: match.directoryName)
-            }
+        if let match = matchProfile(haystack: front.haystack, profiles: profiles) {
+            bind(windowID: front.id, to: match.directoryName)
             activeProfileDirectory = match.directoryName
             return
         }
 
-        inferMissingBindings(using: ProfileStore.shared)
-        if let id = windowID(of: focused), let dir = windowBindings[id] {
-            lastWindowByProfile[dir] = id
+        inferMissingBindings(windows: windows, store: ProfileStore.shared)
+        if let dir = windowBindings[front.id] {
+            lastWindowByProfile[dir] = front.id
             activeProfileDirectory = dir
             persistBindings()
             return
         }
+
+        if let lastUsed = ProfileStore.shared.lastUsedDirectory,
+           profiles.contains(where: { $0.directoryName == lastUsed }) {
+            bind(windowID: front.id, to: lastUsed)
+            activeProfileDirectory = lastUsed
+            return
+        }
+
         activeProfileDirectory = nil
+    }
+
+    // MARK: - Focus existing
+
+    @discardableResult
+    private func raiseExistingWindow(for profile: EdgeProfile) -> Bool {
+        var windows = listScriptedWindows()
+        guard !windows.isEmpty else { return false }
+
+        pruneStaleBindings(liveIDs: Set(windows.map(\.id)))
+        inferMissingBindings(windows: windows, store: ProfileStore.shared)
+        windows = listScriptedWindows()
+
+        var matches = windows.filter { windowBindings[$0.id] == profile.directoryName }
+
+        if matches.isEmpty {
+            for window in windows where windowBindings[window.id] == nil {
+                if matchProfile(haystack: window.haystack, profiles: [profile]) != nil {
+                    bind(windowID: window.id, to: profile.directoryName)
+                    matches.append(window)
+                }
+            }
+        }
+
+        // Re-check bindings after matching pass.
+        if matches.isEmpty {
+            matches = windows.filter { windowBindings[$0.id] == profile.directoryName }
+        }
+
+        guard !matches.isEmpty else { return false }
+
+        let target: ScriptedWindow
+        if let lastID = lastWindowByProfile[profile.directoryName],
+           let last = matches.first(where: { $0.id == lastID }) {
+            target = last
+        } else {
+            // AppleScript windows are ordered front-to-back; lowest index is latest/frontmost.
+            target = matches.min(by: { $0.index < $1.index }) ?? matches[0]
+        }
+
+        guard raiseScriptedWindow(id: target.id) else { return false }
+        bind(windowID: target.id, to: profile.directoryName)
+        activeProfileDirectory = profile.directoryName
+        return true
+    }
+
+    private func inferMissingBindings(windows: [ScriptedWindow], store: ProfileStore) {
+        let profiles = store.profiles
+        guard !windows.isEmpty, !profiles.isEmpty else { return }
+
+        for window in windows where windowBindings[window.id] == nil {
+            if let match = matchProfile(haystack: window.haystack, profiles: profiles) {
+                bind(windowID: window.id, to: match.directoryName)
+            }
+        }
+
+        let activeDirs = Set(store.lastActiveDirectories.isEmpty
+            ? profiles.map(\.directoryName)
+            : store.lastActiveDirectories)
+        let boundDirs = Set(windowBindings.values)
+        let unboundDirs = activeDirs.subtracting(boundDirs)
+        let unboundWindows = windows.filter { windowBindings[$0.id] == nil }
+
+        if unboundDirs.count == 1, unboundWindows.count == 1,
+           let dir = unboundDirs.first, let window = unboundWindows.first {
+            bind(windowID: window.id, to: dir)
+        }
+    }
+
+    private func matchProfile(haystack: String, profiles: [EdgeProfile]) -> EdgeProfile? {
+        let lower = haystack.lowercased()
+
+        // Prefer email / userName hits — unique and present in many Edge tab titles.
+        let emailHits = profiles.filter { profile in
+            guard let email = profile.userName?.lowercased(), !email.isEmpty else { return false }
+            return lower.contains(email)
+        }
+        if emailHits.count == 1 { return emailHits[0] }
+        if emailHits.count > 1 {
+            return emailHits.max(by: { ($0.userName?.count ?? 0) < ($1.userName?.count ?? 0) })
+        }
+
+        let ranked = profiles.sorted {
+            ($0.titleMatchTokens.map(\.count).max() ?? 0) > ($1.titleMatchTokens.map(\.count).max() ?? 0)
+        }
+        for profile in ranked {
+            if titleMatches(lower, profile: profile) {
+                return profile
+            }
+        }
+        return nil
+    }
+
+    private func titleMatches(_ lowerHaystack: String, profile: EdgeProfile) -> Bool {
+        for token in profile.titleMatchTokens {
+            let t = token.lowercased()
+            guard !t.isEmpty else { continue }
+            // Require structured title segments so page titles (e.g. containing "Ortet") do not steal matches.
+            if lowerHaystack.contains(" - \(t) - ")
+                || lowerHaystack.contains(" - \(t)\n")
+                || lowerHaystack.hasSuffix(" - \(t)")
+                || lowerHaystack == t
+                || lowerHaystack.contains(" - \(t) - microsoft edge") {
+                return true
+            }
+        }
+        if let windowName = profile.windowName?.lowercased(), !windowName.isEmpty {
+            if lowerHaystack.contains(windowName) { return true }
+        }
+        return false
+    }
+
+    // MARK: - AppleScript bridge
+
+    private func listScriptedWindows() -> [ScriptedWindow] {
+        let source = """
+        tell application "Microsoft Edge"
+          if (count of windows) is 0 then return ""
+          set rs to ASCII character 30
+          set out to ""
+          repeat with w in windows
+            set wid to id of w as text
+            set windex to index of w as text
+            set wname to name of w as text
+            set wtab to ""
+            try
+              set wtab to title of active tab of w as text
+            end try
+            set out to out & wid & rs & windex & rs & wname & rs & wtab & linefeed
+          end repeat
+          return out
+        end tell
+        """
+        guard let output = runAppleScript(source)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !output.isEmpty
+        else { return [] }
+
+        let rs = String(Character(UnicodeScalar(30)!))
+        var result: [ScriptedWindow] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let comps = String(line).components(separatedBy: rs)
+            guard comps.count >= 3, let index = Int(comps[1]) else { continue }
+            let name = comps[2]
+            let tab = comps.count > 3 ? comps[3] : ""
+            result.append(ScriptedWindow(id: comps[0], index: index, name: name, tabTitle: tab))
+        }
+        return result
+    }
+
+    private func raiseScriptedWindow(id: String) -> Bool {
+        let escaped = id
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+        let source = """
+        tell application "Microsoft Edge"
+          activate
+          try
+            set index of window id "\(escaped)" to 1
+            return "ok"
+          on error errMsg
+            return "err:" & errMsg
+          end try
+        end tell
+        """
+        let result = runAppleScript(source) ?? ""
+        return result == "ok"
+    }
+
+    private func runAppleScript(_ source: String) -> String? {
+        var error: NSDictionary?
+        guard let script = NSAppleScript(source: source) else { return nil }
+        let result = script.executeAndReturnError(&error)
+        if error != nil { return nil }
+        return result.stringValue
     }
 
     // MARK: - Launch
@@ -115,7 +313,7 @@ final class EdgeController: ObservableObject {
         let edgeBinary = URL(fileURLWithPath: Self.edgeBinaryPath)
         guard FileManager.default.isExecutableFile(atPath: edgeBinary.path) else { return }
 
-        let existingIDs = Set(enumerateEdgeWindows().compactMap { windowID(of: $0) })
+        let existingIDs = Set(listScriptedWindows().map(\.id))
 
         let process = Process()
         process.executableURL = edgeBinary
@@ -130,234 +328,57 @@ final class EdgeController: ObservableObject {
             return
         }
 
-        // Bind newly created window within ~2s.
-        scheduleWindowBinding(profile: profile, excluding: existingIDs, attempts: 20)
+        scheduleWindowBinding(profile: profile, excluding: existingIDs, attempts: 25)
         activeProfileDirectory = profile.directoryName
     }
 
-    private func scheduleWindowBinding(profile: EdgeProfile, excluding: Set<CGWindowID>, attempts: Int) {
+    private func scheduleWindowBinding(profile: EdgeProfile, excluding: Set<String>, attempts: Int) {
         guard attempts > 0 else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             guard let self else { return }
-            let windows = self.enumerateEdgeWindows()
-            for window in windows {
-                guard let id = self.windowID(of: window), !excluding.contains(id) else { continue }
-                // Prefer title / chrome match; otherwise bind the newest unbound window.
-                if self.identifyProfile(of: window, profiles: [profile]) != nil
-                    || self.windowBindings[id] == nil {
-                    self.bind(windowID: id, to: profile.directoryName)
-                    self.raise(window: window, profile: profile)
-                    return
-                }
+            let windows = self.listScriptedWindows()
+            if let fresh = windows.first(where: { !excluding.contains($0.id) }) {
+                self.bind(windowID: fresh.id, to: profile.directoryName)
+                _ = self.raiseScriptedWindow(id: fresh.id)
+                return
             }
             self.scheduleWindowBinding(profile: profile, excluding: excluding, attempts: attempts - 1)
         }
     }
 
-    // MARK: - Window matching / raise
+    // MARK: - Bindings
 
-    /// Prefer the most recently focused window for this profile; otherwise the frontmost match.
-    private func findWindow(for profile: EdgeProfile) -> AXUIElement? {
-        pruneStaleBindings()
-        inferMissingBindings(using: ProfileStore.shared)
-
-        let windows = enumerateEdgeWindows()
-        guard !windows.isEmpty else { return nil }
-
-        var byID: [CGWindowID: AXUIElement] = [:]
-        var matches: [AXUIElement] = []
-
-        for window in windows {
-            guard let id = windowID(of: window) else { continue }
-            byID[id] = window
-
-            if windowBindings[id] == profile.directoryName {
-                matches.append(window)
-                continue
-            }
-            if identifyProfile(of: window, profiles: [profile]) != nil {
-                bind(windowID: id, to: profile.directoryName)
-                matches.append(window)
-            }
-        }
-
-        guard !matches.isEmpty else { return nil }
-
-        if let lastID = lastWindowByProfile[profile.directoryName],
-           let last = byID[lastID],
-           matches.contains(where: { windowID(of: $0) == lastID }) {
-            return last
-        }
-
-        let frontToBack = frontToBackEdgeWindowIDs()
-        let ranked = matches.sorted { lhs, rhs in
-            let lid = windowID(of: lhs) ?? 0
-            let rid = windowID(of: rhs) ?? 0
-            let li = frontToBack.firstIndex(of: lid) ?? .max
-            let ri = frontToBack.firstIndex(of: rid) ?? .max
-            return li < ri
-        }
-        return ranked.first
+    private func bind(windowID: String, to directoryName: String) {
+        windowBindings[windowID] = directoryName
+        lastWindowByProfile[directoryName] = windowID
+        persistBindings()
     }
 
-    /// Fill gaps when exactly one unbound browser window remains for one unbound active profile,
-    /// and attribute the focused Edge window to Local State's `last_used` when unknown.
-    private func inferMissingBindings(using store: ProfileStore) {
-        let windows = enumerateEdgeWindows()
-        guard !windows.isEmpty else { return }
-
-        if let focusedApp = edgeRunningApp(), focusedApp.isActive {
-            let appElement = AXUIElementCreateApplication(focusedApp.processIdentifier)
-            if let focused = copyAXElement(appElement, kAXFocusedWindowAttribute),
-               let id = windowID(of: focused),
-               windowBindings[id] == nil,
-               let lastUsed = store.lastUsedDirectory,
-               store.profiles.contains(where: { $0.directoryName == lastUsed }) {
-                bind(windowID: id, to: lastUsed)
-            }
-        }
-
-        let activeDirs = Set(store.lastActiveDirectories.isEmpty
-            ? store.profiles.map(\.directoryName)
-            : store.lastActiveDirectories)
-        let boundDirs = Set(windowBindings.values)
-        let unboundDirs = activeDirs.subtracting(boundDirs)
-        let unboundWindows = windows.compactMap { window -> CGWindowID? in
-            guard let id = windowID(of: window), windowBindings[id] == nil else { return nil }
-            return id
-        }
-
-        if unboundDirs.count == 1, unboundWindows.count == 1,
-           let dir = unboundDirs.first, let id = unboundWindows.first {
-            bind(windowID: id, to: dir)
+    private func pruneStaleBindings(liveIDs: Set<String>) {
+        let before = windowBindings.count
+        windowBindings = windowBindings.filter { liveIDs.contains($0.key) }
+        lastWindowByProfile = lastWindowByProfile.filter { liveIDs.contains($0.value) }
+        if windowBindings.count != before {
+            persistBindings()
         }
     }
 
-    private func identifyProfile(of window: AXUIElement, profiles: [EdgeProfile]) -> EdgeProfile? {
-        if let title = copyAttribute(window, kAXTitleAttribute) as? String {
-            if let match = matchProfile(title: title, profiles: profiles) {
-                return match
-            }
-        }
-        // Edge often omits the profile from the window title; chrome controls may still expose it.
-        return matchProfileInChrome(window, profiles: profiles)
+    private func persistBindings() {
+        UserDefaults.standard.set(windowBindings, forKey: PreferencesKeys.windowBindings)
+        UserDefaults.standard.set(lastWindowByProfile, forKey: PreferencesKeys.lastWindowByProfile)
     }
 
-    /// Shallow scan for an accessibility label that exactly matches a known profile token.
-    private func matchProfileInChrome(_ window: AXUIElement, profiles: [EdgeProfile]) -> EdgeProfile? {
-        let tokens: [(String, EdgeProfile)] = profiles.flatMap { profile in
-            profile.titleMatchTokens
-                .filter { !$0.isEmpty }
-                .map { ($0, profile) }
+    private func loadPersistedBindings() {
+        if let raw = UserDefaults.standard.dictionary(forKey: PreferencesKeys.windowBindings) as? [String: String] {
+            // Migrate away from old CGWindowID numeric keys if Edge was restarted; keep whatever is present.
+            windowBindings = raw
         }
-        guard !tokens.isEmpty else { return nil }
-
-        var stack: [(AXUIElement, Int)] = [(window, 0)]
-        var visited = 0
-        while let (element, depth) = stack.popLast(), visited < 120, depth < 6 {
-            visited += 1
-            let title = (copyAttribute(element, kAXTitleAttribute) as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let description = (copyAttribute(element, kAXDescriptionAttribute) as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            let help = (copyAttribute(element, "AXHelp") as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-
-            for candidate in [title, description, help] where !candidate.isEmpty {
-                for (token, profile) in tokens {
-                    if candidate.compare(token, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame {
-                        return profile
-                    }
-                }
-            }
-
-            if depth < 5 {
-                for child in copyAXElementArray(element, kAXChildrenAttribute).reversed() {
-                    stack.append((child, depth + 1))
-                }
-            }
+        if let raw = UserDefaults.standard.dictionary(forKey: PreferencesKeys.lastWindowByProfile) as? [String: String] {
+            lastWindowByProfile = raw
         }
-        return nil
     }
 
-    private func titleMatches(_ title: String, profile: EdgeProfile) -> Bool {
-        let lower = title.lowercased()
-        for token in profile.titleMatchTokens {
-            let t = token.lowercased()
-            guard !t.isEmpty else { continue }
-            // Edge titles often look like: "Page - ProfileName - Microsoft Edge"
-            if lower.contains(" - \(t) - microsoft edge")
-                || lower.hasSuffix(" - \(t)")
-                || lower.contains(" - \(t) - ")
-                || lower == t {
-                return true
-            }
-        }
-        if let windowName = profile.windowName?.lowercased(), !windowName.isEmpty {
-            if lower.contains(windowName) { return true }
-        }
-        return false
-    }
-
-    private func matchProfile(title: String, profiles: [EdgeProfile]) -> EdgeProfile? {
-        // Prefer longer tokens to avoid ambiguous short-name collisions.
-        let ranked = profiles.sorted {
-            ($0.titleMatchTokens.map(\.count).max() ?? 0) > ($1.titleMatchTokens.map(\.count).max() ?? 0)
-        }
-        for profile in ranked {
-            if titleMatches(title, profile: profile) {
-                return profile
-            }
-        }
-        return nil
-    }
-
-    private func raise(window: AXUIElement, profile: EdgeProfile) {
-        guard let edgeApp = edgeRunningApp() else { return }
-        edgeApp.activate(options: [.activateIgnoringOtherApps])
-        AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-        if let id = windowID(of: window) {
-            bind(windowID: id, to: profile.directoryName)
-        }
-        activeProfileDirectory = profile.directoryName
-    }
-
-    private func enumerateEdgeWindows() -> [AXUIElement] {
-        guard let edgeApp = edgeRunningApp() else { return [] }
-        let appElement = AXUIElementCreateApplication(edgeApp.processIdentifier)
-        return copyAXElementArray(appElement, kAXWindowsAttribute)
-            .filter { isNormalBrowserWindow($0) }
-    }
-
-    private func isNormalBrowserWindow(_ window: AXUIElement) -> Bool {
-        let role = copyAttribute(window, kAXRoleAttribute) as? String
-        if role != nil && role != (kAXWindowRole as String) { return false }
-        let subrole = copyAttribute(window, kAXSubroleAttribute) as? String
-        if let subrole, subrole == (kAXDialogSubrole as String) || subrole == "AXSystemDialog" {
-            return false
-        }
-        return true
-    }
-
-    private func frontToBackEdgeWindowIDs() -> [CGWindowID] {
-        let opts = CGWindowListOption(arrayLiteral: .optionOnScreenOnly, .excludeDesktopElements)
-        guard let info = CGWindowListCopyWindowInfo(opts, kCGNullWindowID) as? [[String: Any]] else {
-            return []
-        }
-        var result: [CGWindowID] = []
-        for entry in info {
-            guard let owner = entry[kCGWindowOwnerName as String] as? String,
-                  owner == "Microsoft Edge",
-                  let layer = entry[kCGWindowLayer as String] as? Int,
-                  layer == 0,
-                  let number = entry[kCGWindowNumber as String] as? CGWindowID
-            else { continue }
-            result.append(number)
-        }
-        return result
-    }
+    // MARK: - AX helpers (secondary)
 
     private func edgeRunningApp() -> NSRunningApplication? {
         NSWorkspace.shared.runningApplications.first {
@@ -365,78 +386,11 @@ final class EdgeController: ObservableObject {
         }
     }
 
-    private func windowID(of element: AXUIElement) -> CGWindowID? {
-        var id: CGWindowID = 0
-        let err = _AXUIElementGetWindow(element, &id)
-        return err == .success ? id : nil
-    }
-
-    private func bind(windowID: CGWindowID, to directoryName: String) {
-        windowBindings[windowID] = directoryName
-        lastWindowByProfile[directoryName] = windowID
-        persistBindings()
-    }
-
-    private func pruneStaleBindings() {
-        let live = Set(enumerateEdgeWindows().compactMap { windowID(of: $0) })
-        let before = windowBindings.count
-        windowBindings = windowBindings.filter { live.contains($0.key) }
-        lastWindowByProfile = lastWindowByProfile.filter { live.contains($0.value) }
-        if windowBindings.count != before {
-            persistBindings()
-        }
-    }
-
-    private func persistBindings() {
-        let bindings = Dictionary(uniqueKeysWithValues: windowBindings.map { (String($0.key), $0.value) })
-        let last = Dictionary(uniqueKeysWithValues: lastWindowByProfile.map { ($0.key, String($0.value)) })
-        UserDefaults.standard.set(bindings, forKey: PreferencesKeys.windowBindings)
-        UserDefaults.standard.set(last, forKey: PreferencesKeys.lastWindowByProfile)
-    }
-
-    private func loadPersistedBindings() {
-        if let raw = UserDefaults.standard.dictionary(forKey: PreferencesKeys.windowBindings) as? [String: String] {
-            for (key, value) in raw {
-                if let id = CGWindowID(key) {
-                    windowBindings[id] = value
-                }
-            }
-        }
-        if let raw = UserDefaults.standard.dictionary(forKey: PreferencesKeys.lastWindowByProfile) as? [String: String] {
-            for (dir, value) in raw {
-                if let id = CGWindowID(value) {
-                    lastWindowByProfile[dir] = id
-                }
-            }
-        }
-    }
-
-    private func copyAttribute(_ element: AXUIElement, _ attribute: String) -> AnyObject? {
-        var value: AnyObject?
-        let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        return err == .success ? value : nil
-    }
-
     private func copyAXElement(_ element: AXUIElement, _ attribute: String) -> AXUIElement? {
         var value: CFTypeRef?
         let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
         guard err == .success, let value else { return nil }
         return (value as! AXUIElement)
-    }
-
-    private func copyAXElementArray(_ element: AXUIElement, _ attribute: String) -> [AXUIElement] {
-        var value: CFTypeRef?
-        let err = AXUIElementCopyAttributeValue(element, attribute as CFString, &value)
-        guard err == .success, let value else { return [] }
-        let array = value as! CFArray
-        var result: [AXUIElement] = []
-        let count = CFArrayGetCount(array)
-        for i in 0..<count {
-            let ptr = CFArrayGetValueAtIndex(array, i)
-            let window = unsafeBitCast(ptr, to: AXUIElement.self)
-            result.append(window)
-        }
-        return result
     }
 
     nonisolated static func normalizeURL(_ raw: String) -> String? {

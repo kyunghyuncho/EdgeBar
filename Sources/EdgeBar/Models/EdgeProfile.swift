@@ -43,9 +43,12 @@ struct EdgeProfile: Identifiable, Hashable, Sendable {
         return String(displayName.prefix(2)).uppercased()
     }
 
-    /// Substrings that identify this profile in Edge window titles.
+    /// Substrings that identify this profile in Edge window / tab titles.
     var titleMatchTokens: [String] {
         var tokens: [String] = [displayName]
+        if let userName, !userName.isEmpty {
+            tokens.append(userName)
+        }
         if let windowName, !windowName.isEmpty {
             tokens.append(windowName)
         }
