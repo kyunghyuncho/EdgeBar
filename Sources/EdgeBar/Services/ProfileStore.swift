@@ -199,4 +199,7 @@ enum PreferencesKeys {
     static let panelOriginX = "edgebar.panelOriginX"
     static let panelOriginY = "edgebar.panelOriginY"
     static let pendingURLProfile = "edgebar.pendingURLProfile"
+    static let windowBindings = "edgebar.windowBindings"
+    static let lastWindowByProfile = "edgebar.lastWindowByProfile"
+    static let manualWindowIDs = "edgebar.manualWindowIDs"
 }
