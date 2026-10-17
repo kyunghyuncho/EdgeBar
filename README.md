@@ -22,14 +22,14 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 ## Behaviour
 
 - Profiles are read from `~/Library/Application Support/Microsoft Edge/Local State` and refreshed when that directory changes.
-- Activating a profile raises an existing Edge window when title / `CGWindowID` bindings match; otherwise Edge is invoked via its Mach-O binary with `--profile-directory=…` (never `open -a … --args`).
+- Activating a profile raises the latest existing Edge window for that profile (last-focused, else frontmost match via title / chrome label / `CGWindowID` bindings). A new window is spawned only when none are open for that profile (never `open -a … --args`).
 - Global shortcuts: `⌃⌥1`–`⌃⌥9`.
 - Menu bar item toggles Edge-aware auto-hide vs always visible, and left/right docking.
 - Drag a URL onto a profile avatar to open it in that profile.
 
 ## Window matching tip
 
-For Edge windows that were already open before EdgeBar launched, enable **Show profile name in the title bar** under `edge://settings/appearance`, or use **Name window…** so the profile name appears in the title. Alternatively, right-click a profile in EdgeBar and choose **Bind Frontmost Edge Window**.
+EdgeBar remembers which windows belong to which profile (including across EdgeBar relaunches while Edge stays open) and learns from focus changes. For windows opened before any binding exists, enable **Show profile name in the title bar** under `edge://settings/appearance`, or right-click a profile and choose **Bind Frontmost Edge Window**. Shift/⌘-click (or middle-click) still force-opens a new window.
 
 ## Architecture
 
