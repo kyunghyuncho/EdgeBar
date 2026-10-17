@@ -22,14 +22,14 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 ## Behaviour
 
 - Profiles are read from `~/Library/Application Support/Microsoft Edge/Local State` and refreshed when that directory changes.
-- Activating a profile raises the latest existing Edge window for that profile via Edge’s AppleScript API (match by signed-in email / title tokens / remembered window ids). A new window is spawned only when none are open for that profile (never `open -a … --args`). macOS may prompt once to allow EdgeBar to control Microsoft Edge.
+- Activating a profile raises that profile’s existing Edge window by matching live window bounds to each profile’s saved `browser.window_placement` (then raising via AppleScript). A new window is spawned only when none match. macOS may prompt once to allow EdgeBar to control Microsoft Edge.
 - Global shortcuts: `⌃⌥1`–`⌃⌥9`.
 - Menu bar item toggles Edge-aware auto-hide vs always visible, and left/right docking.
 - Drag a URL onto a profile avatar to open it in that profile.
 
 ## Window matching tip
 
-EdgeBar talks to Edge through AppleScript (Automation), not Accessibility, so focusing still works after ad-hoc rebuilds. It matches windows using the signed-in email in tab titles when present, remembers window ids, and can infer the last unbound active profile. Right-click **Bind Frontmost Edge Window** if a window cannot be matched. Shift/⌘-click (or middle-click) still force-opens a new window.
+Edge remembers each profile’s window position in `Preferences` (`browser.window_placement`). EdgeBar matches those rectangles to open windows, so focusing does not depend on title-bar profile names. Right-click **Bind Frontmost Edge Window** if a window still cannot be matched (e.g. multiple windows for one profile). Shift/⌘-click (or middle-click) still force-opens a new window.
 
 ## Architecture
 
