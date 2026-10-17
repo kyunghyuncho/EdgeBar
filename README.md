@@ -29,7 +29,7 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 
 ## Window matching tip
 
-Edge remembers each profile’s window position in `Preferences` (`browser.window_placement`). EdgeBar matches those rectangles to open windows, so focusing does not depend on title-bar profile names. Right-click **Bind Frontmost Edge Window** if a window still cannot be matched (e.g. multiple windows for one profile). Shift/⌘-click (or middle-click) still force-opens a new window.
+Edge remembers each profile’s window position in `Preferences` (`browser.window_placement`). EdgeBar matches those rectangles to open windows (unique exact geometry only), so focusing does not depend on title-bar profile names. Right-click **Bind Frontmost Edge Window** to pin a window that placement cannot identify (e.g. a second window for the same profile); manual binds survive rematching. Shift/⌘-click (or middle-click) still force-opens a new window. Allow **Automation** for EdgeBar → Microsoft Edge on first use.
 
 ## Architecture
 

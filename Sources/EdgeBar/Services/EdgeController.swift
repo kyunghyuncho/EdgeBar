@@ -5,7 +5,7 @@ import Foundation
 /// Launches Edge profiles via the Mach-O binary and focuses existing windows.
 ///
 /// Profile → window mapping uses each profile's `browser.window_placement` from Preferences
-/// matched against live AppleScript window bounds. Only exact geometry matches are trusted.
+/// matched against live AppleScript window bounds. Only unique exact geometry matches are trusted.
 @MainActor
 final class EdgeController: ObservableObject {
     static let shared = EdgeController()
@@ -28,9 +28,11 @@ final class EdgeController: ObservableObject {
         let bounds: NSRect
     }
 
-    /// Edge AppleScript window id → profile directory name (exact placement matches only).
+    /// Edge AppleScript window id → profile directory name.
     private var windowBindings: [String: String] = [:]
-    /// Most recently raised window id per profile (must still exact-match that profile's placement).
+    /// Window ids bound via the context-menu action; rematch must not erase these.
+    private var manualWindowIDs: Set<String> = []
+    /// Most recently raised window id per profile (must still be a valid binding).
     private var lastWindowByProfile: [String: String] = [:]
     @Published private(set) var activeProfileDirectory: String?
 
@@ -74,14 +76,16 @@ final class EdgeController: ObservableObject {
     }
 
     func bindFrontmostEdgeWindow(to profile: EdgeProfile) {
+        guard edgeIsRunning else { return }
         guard let front = listScriptedWindows().min(by: { $0.index < $1.index }) else { return }
+        manualWindowIDs.insert(front.id)
         bind(windowID: front.id, to: profile.directoryName)
         _ = raiseScriptedWindow(id: front.id)
         activeProfileDirectory = profile.directoryName
     }
 
     func refreshActiveProfile(from profiles: [EdgeProfile]) {
-        guard edgeRunningApp()?.isActive == true else {
+        guard edgeIsRunning, edgeRunningApp()?.isActive == true else {
             activeProfileDirectory = nil
             return
         }
@@ -104,63 +108,61 @@ final class EdgeController: ObservableObject {
 
     @discardableResult
     private func raiseExistingWindow(for profile: EdgeProfile) -> Bool {
+        guard edgeIsRunning else { return false }
+
         let windows = listScriptedWindows()
         guard !windows.isEmpty else { return false }
 
-        // Rebuild map from disk placements every click — never trust stale nearest-neighbor guesses.
         rematchFromPlacements(profiles: ProfileStore.shared.profiles, windows: windows)
 
-        let placements = loadPlacements(for: [profile])
-        guard let placement = placements.first else {
-            // No saved placement yet: fall back to an explicit binding (e.g. manual bind / just spawned).
-            return raiseBoundWindow(for: profile, windows: windows)
+        if let target = preferredWindow(for: profile, windows: windows) {
+            guard raiseScriptedWindow(id: target.id) else { return false }
+            bind(windowID: target.id, to: profile.directoryName)
+            activeProfileDirectory = profile.directoryName
+            return true
         }
-
-        // Only windows whose live bounds still match this profile's saved placement.
-        let geometricMatches = windows
-            .filter { Self.boundsEqual($0.bounds, placement.bounds, tolerance: Self.placementTolerance) }
-            .sorted { $0.index < $1.index }
-
-        let target: ScriptedWindow?
-        if let last = lastWindowByProfile[profile.directoryName],
-           let hit = geometricMatches.first(where: { $0.id == last }) {
-            target = hit
-        } else {
-            target = geometricMatches.first
-        }
-
-        guard let target else {
-            return raiseBoundWindow(for: profile, windows: windows)
-        }
-        guard raiseScriptedWindow(id: target.id) else { return false }
-        bind(windowID: target.id, to: profile.directoryName)
-        activeProfileDirectory = profile.directoryName
-        return true
+        return false
     }
 
-    private func raiseBoundWindow(for profile: EdgeProfile, windows: [ScriptedWindow]) -> Bool {
-        let matches = windows
+    private func preferredWindow(for profile: EdgeProfile, windows: [ScriptedWindow]) -> ScriptedWindow? {
+        let placements = loadPlacements(for: [profile])
+        if let placement = placements.first {
+            let geometricMatches = windows
+                .filter { Self.boundsEqual($0.bounds, placement.bounds, tolerance: Self.placementTolerance) }
+                .sorted { $0.index < $1.index }
+            if let last = lastWindowByProfile[profile.directoryName],
+               let hit = geometricMatches.first(where: { $0.id == last }) {
+                return hit
+            }
+            if let hit = geometricMatches.first {
+                return hit
+            }
+        }
+
+        // Manual bind or spawn bind that rematch could not confirm geometrically.
+        return windows
             .filter { windowBindings[$0.id] == profile.directoryName }
             .sorted { $0.index < $1.index }
-        guard let target = matches.first else { return false }
-        guard raiseScriptedWindow(id: target.id) else { return false }
-        bind(windowID: target.id, to: profile.directoryName)
-        activeProfileDirectory = profile.directoryName
-        return true
+            .first
     }
 
-    /// Exact geometry match only. Clears prior auto-bindings for live windows first so swaps cannot stick.
+    /// Exact unique geometry matches only. Preserves manual bindings.
     private func rematchFromPlacements(profiles: [EdgeProfile], windows: [ScriptedWindow]? = nil) {
         let placements = loadPlacements(for: profiles)
         let windows = windows ?? listScriptedWindows()
-        guard !placements.isEmpty, !windows.isEmpty else { return }
+        guard !windows.isEmpty else { return }
 
         let liveIDs = Set(windows.map(\.id))
-        // Drop auto-bindings for windows we can see; rebuild from placements.
+        manualWindowIDs = manualWindowIDs.intersection(liveIDs)
+
+        let preservedManual = windowBindings.filter {
+            liveIDs.contains($0.key) && manualWindowIDs.contains($0.key)
+        }
+
+        // Drop auto-bindings for live windows; rebuild from placements.
         windowBindings = windowBindings.filter { !liveIDs.contains($0.key) }
 
         var usedWindows = Set<String>()
-        // Prefer uniquely matching placements when two profiles share nearly identical rects.
         let ordered = placements.sorted { lhs, rhs in
             uniquenessScore(lhs, among: placements) > uniquenessScore(rhs, among: placements)
         }
@@ -170,18 +172,22 @@ final class EdgeController: ObservableObject {
                 !usedWindows.contains($0.id)
                     && Self.boundsEqual($0.bounds, placement.bounds, tolerance: Self.placementTolerance)
             }
-            // Require a unique geometric hit — never grab the "closest" other profile's window.
             guard hits.count == 1, let window = hits.first else { continue }
             windowBindings[window.id] = placement.directoryName
             lastWindowByProfile[placement.directoryName] = window.id
             usedWindows.insert(window.id)
         }
 
+        // Restore manual binds for windows placement did not claim.
+        for (id, dir) in preservedManual where windowBindings[id] == nil {
+            windowBindings[id] = dir
+            lastWindowByProfile[dir] = id
+        }
+
         lastWindowByProfile = lastWindowByProfile.filter { liveIDs.contains($0.value) }
         persistBindings()
     }
 
-    /// Higher when this placement is farther from every other profile's placement.
     private func uniquenessScore(_ placement: Placement, among all: [Placement]) -> CGFloat {
         let others = all.filter { $0.directoryName != placement.directoryName }
         guard let nearest = others.map({ Self.boundsDistance(placement.bounds, $0.bounds) }).min() else {
@@ -240,7 +246,12 @@ final class EdgeController: ObservableObject {
 
     // MARK: - AppleScript bridge
 
+    private var edgeIsRunning: Bool { edgeRunningApp() != nil }
+
     private func listScriptedWindows() -> [ScriptedWindow] {
+        // Never `tell application "Microsoft Edge"` when it is quit — that launches it.
+        guard edgeIsRunning else { return [] }
+
         let source = """
         tell application "Microsoft Edge"
           if (count of windows) is 0 then return ""
@@ -283,6 +294,7 @@ final class EdgeController: ObservableObject {
     }
 
     private func raiseScriptedWindow(id: String) -> Bool {
+        guard edgeIsRunning else { return false }
         let escaped = id
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
@@ -336,20 +348,25 @@ final class EdgeController: ObservableObject {
     private func scheduleWindowBinding(profile: EdgeProfile, excluding: Set<String>, attempts: Int) {
         guard attempts > 0 else { return }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-            guard let self else { return }
+            guard let self, self.edgeIsRunning else { return }
             let windows = self.listScriptedWindows()
             self.rematchFromPlacements(profiles: ProfileStore.shared.profiles, windows: windows)
+
             if let known = self.windowBindings.first(where: { $0.value == profile.directoryName })?.key {
                 self.lastWindowByProfile[profile.directoryName] = known
                 _ = self.raiseScriptedWindow(id: known)
                 self.persistBindings()
                 return
             }
-            if let fresh = windows.first(where: { !excluding.contains($0.id) }) {
-                self.bind(windowID: fresh.id, to: profile.directoryName)
-                _ = self.raiseScriptedWindow(id: fresh.id)
+
+            // Only claim a brand-new window when it is the sole newcomer — otherwise wait for placement.
+            let fresh = windows.filter { !excluding.contains($0.id) }
+            if fresh.count == 1, let only = fresh.first {
+                self.bind(windowID: only.id, to: profile.directoryName)
+                _ = self.raiseScriptedWindow(id: only.id)
                 return
             }
+
             self.scheduleWindowBinding(profile: profile, excluding: excluding, attempts: attempts - 1)
         }
     }
@@ -357,7 +374,6 @@ final class EdgeController: ObservableObject {
     // MARK: - Bindings
 
     private func bind(windowID: String, to directoryName: String) {
-        // Ensure a window is only claimed by one profile.
         windowBindings = windowBindings.filter { $0.key != windowID && $0.value != directoryName }
         windowBindings[windowID] = directoryName
         lastWindowByProfile[directoryName] = windowID
@@ -367,6 +383,7 @@ final class EdgeController: ObservableObject {
     private func persistBindings() {
         UserDefaults.standard.set(windowBindings, forKey: PreferencesKeys.windowBindings)
         UserDefaults.standard.set(lastWindowByProfile, forKey: PreferencesKeys.lastWindowByProfile)
+        UserDefaults.standard.set(Array(manualWindowIDs), forKey: PreferencesKeys.manualWindowIDs)
     }
 
     private func loadPersistedBindings() {
@@ -375,6 +392,9 @@ final class EdgeController: ObservableObject {
         }
         if let raw = UserDefaults.standard.dictionary(forKey: PreferencesKeys.lastWindowByProfile) as? [String: String] {
             lastWindowByProfile = raw
+        }
+        if let raw = UserDefaults.standard.array(forKey: PreferencesKeys.manualWindowIDs) as? [String] {
+            manualWindowIDs = Set(raw)
         }
     }
 

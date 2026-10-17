@@ -6,10 +6,6 @@ import Combine
 final class ProfileStore: ObservableObject {
     @Published private(set) var profiles: [EdgeProfile] = []
     @Published private(set) var lastError: String?
-    /// Edge `profile.last_used` directory key from Local State.
-    @Published private(set) var lastUsedDirectory: String?
-    /// Edge `profile.last_active_profiles` directory keys from Local State.
-    @Published private(set) var lastActiveDirectories: [String] = []
 
     private let edgeSupportURL: URL
     private let localStateURL: URL
@@ -33,9 +29,6 @@ final class ProfileStore: ObservableObject {
         do {
             let loaded = try Self.loadProfiles(from: localStateURL, edgeSupportURL: edgeSupportURL)
             profiles = Self.sortProfiles(loaded)
-            let meta = try Self.loadProfileActivity(from: localStateURL)
-            lastUsedDirectory = meta.lastUsed
-            lastActiveDirectories = meta.lastActive
             lastError = nil
         } catch {
             lastError = error.localizedDescription
@@ -43,18 +36,6 @@ final class ProfileStore: ObservableObject {
                 profiles = []
             }
         }
-    }
-
-    nonisolated static func loadProfileActivity(from localStateURL: URL) throws -> (lastUsed: String?, lastActive: [String]) {
-        let data = try Data(contentsOf: localStateURL, options: [.mappedIfSafe])
-        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let profileRoot = root["profile"] as? [String: Any]
-        else {
-            return (nil, [])
-        }
-        let lastUsed = profileRoot["last_used"] as? String
-        let lastActive = profileRoot["last_active_profiles"] as? [String] ?? []
-        return (lastUsed, lastActive)
     }
 
     // MARK: - Parsing
@@ -220,4 +201,5 @@ enum PreferencesKeys {
     static let pendingURLProfile = "edgebar.pendingURLProfile"
     static let windowBindings = "edgebar.windowBindings"
     static let lastWindowByProfile = "edgebar.lastWindowByProfile"
+    static let manualWindowIDs = "edgebar.manualWindowIDs"
 }
