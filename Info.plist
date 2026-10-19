@@ -39,7 +39,23 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>URL</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Alternate</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.url</string>
+				<string>public.html</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>EdgeBar needs Accessibility access to focus existing Microsoft Edge profile windows.</string>
+	<string>EdgeBar needs Automation access to control Microsoft Edge (raise profile windows) and Accessibility access to focus existing windows.</string>
 </dict>
 </plist>
