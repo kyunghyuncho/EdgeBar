@@ -18,11 +18,14 @@ enum EdgeBarMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var panel: FloatingSidebarPanel?
+    private var urlPickerPanel: URLPickerPanel?
+    private var pendingPickerURL: String?
     private var cancellables = Set<AnyCancellable>()
     private var hotKeyRefs: [EventHotKeyRef?] = []
     private var eventHandler: EventHandlerRef?
     private var middleClickMonitor: Any?
     private var localKeyMonitor: Any?
+    private var pickerKeyMonitor: Any?
 
     private let store = ProfileStore.shared
     private let controller = EdgeController.shared
@@ -49,6 +52,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         unregisterHotKeys()
         focus.shutdown()
+        tearDownPickerKeyMonitor()
         if let middleClickMonitor {
             NSEvent.removeMonitor(middleClickMonitor)
         }
@@ -69,17 +73,104 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func route(urls: [URL]) {
-        guard let first = urls.first else { return }
-        let defaults = UserDefaults.standard
-        let preferredDir = defaults.string(forKey: PreferencesKeys.pendingURLProfile)
-        let profile: EdgeProfile?
-        if let preferredDir {
-            profile = store.profiles.first { $0.directoryName == preferredDir }
-        } else {
-            profile = store.profiles.first
+        guard let first = urls.first,
+              let urlString = Self.resolveRoutableURL(from: first)
+        else { return }
+        presentURLPicker(for: urlString)
+    }
+
+    /// Unwraps `edgebar:` wrappers so Edge receives a normal http(s) URL.
+    private static func resolveRoutableURL(from url: URL) -> String? {
+        let absolute = url.absoluteString
+        if url.scheme?.lowercased() == "edgebar" {
+            let lowered = absolute.lowercased()
+            if let httpRange = lowered.range(of: "https://") ?? lowered.range(of: "http://") {
+                let start = absolute.index(
+                    absolute.startIndex,
+                    offsetBy: lowered.distance(from: lowered.startIndex, to: httpRange.lowerBound)
+                )
+                let extracted = String(absolute[start...])
+                return EdgeController.normalizeURL(extracted) ?? extracted
+            }
+            if let host = url.host, !host.isEmpty {
+                let path = url.path
+                let candidate = path.isEmpty ? host : "\(host)\(path)"
+                return EdgeController.normalizeURL(candidate)
+            }
+            return nil
         }
-        guard let profile else { return }
-        controller.open(url: first.absoluteString, in: profile)
+        return absolute
+    }
+
+    private func presentURLPicker(for urlString: String) {
+        pendingPickerURL = urlString
+        let picker = urlPickerPanel ?? URLPickerPanel()
+        picker.onDismiss = { [weak self] in
+            self?.dismissURLPicker(open: false)
+        }
+        picker.host(
+            URLPickerView(
+                urlString: urlString,
+                profiles: store.profiles,
+                onSelect: { [weak self] profile in
+                    self?.selectPickerProfile(profile)
+                },
+                onCancel: { [weak self] in
+                    self?.dismissURLPicker(open: false)
+                }
+            )
+        )
+        urlPickerPanel = picker
+        picker.present(profileCount: store.profiles.count)
+        installPickerKeyMonitor()
+    }
+
+    private func selectPickerProfile(_ profile: EdgeProfile) {
+        guard let url = pendingPickerURL else {
+            dismissURLPicker(open: false)
+            return
+        }
+        controller.open(url: url, in: profile)
+        dismissURLPicker(open: true)
+    }
+
+    private func dismissURLPicker(open _: Bool) {
+        tearDownPickerKeyMonitor()
+        pendingPickerURL = nil
+        // Clear onDismiss before resign/orderOut to avoid re-entrancy.
+        urlPickerPanel?.onDismiss = nil
+        urlPickerPanel?.dismiss()
+    }
+
+    private func installPickerKeyMonitor() {
+        tearDownPickerKeyMonitor()
+        pickerKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, self.pendingPickerURL != nil else { return event }
+            if event.keyCode == 53 { // Escape
+                self.dismissURLPicker(open: false)
+                return nil
+            }
+            if let chars = event.charactersIgnoringModifiers,
+               let digit = chars.first,
+               digit >= "1", digit <= "9",
+               !event.modifierFlags.contains(.command),
+               !event.modifierFlags.contains(.control),
+               !event.modifierFlags.contains(.option) {
+                let index = Int(String(digit))! - 1
+                if index >= 0, index < self.store.profiles.count {
+                    self.selectPickerProfile(self.store.profiles[index])
+                    return nil
+                }
+            }
+            return event
+        }
+    }
+
+    private func tearDownPickerKeyMonitor() {
+        if let pickerKeyMonitor {
+            NSEvent.removeMonitor(pickerKeyMonitor)
+            self.pickerKeyMonitor = nil
+        }
     }
 
     // MARK: - Status item
@@ -169,6 +260,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
+        let defaultBrowserTitle: String
+        if DefaultBrowser.isDefault {
+            defaultBrowserTitle = "EdgeBar Is Default Browser"
+        } else {
+            defaultBrowserTitle = "Use EdgeBar as Default Browser…"
+        }
+        let defaultBrowser = NSMenuItem(
+            title: defaultBrowserTitle,
+            action: DefaultBrowser.isDefault ? nil : #selector(makeDefaultBrowser),
+            keyEquivalent: ""
+        )
+        defaultBrowser.target = self
+        defaultBrowser.state = DefaultBrowser.isDefault ? .on : .off
+        if DefaultBrowser.isDefault {
+            defaultBrowser.isEnabled = false
+        }
+        menu.addItem(defaultBrowser)
+
         let reload = NSMenuItem(
             title: "Reload Profiles from Local State",
             action: #selector(reloadProfiles),
@@ -184,6 +293,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quit)
 
         statusItem?.menu = menu
+    }
+
+    @objc private func makeDefaultBrowser() {
+        _ = DefaultBrowser.setAsDefault()
+        // macOS may show a confirmation; refresh status after a short delay.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.rebuildMenu()
+        }
+        rebuildMenu()
     }
 
     @objc private func menuActivateProfile(_ sender: NSMenuItem) {

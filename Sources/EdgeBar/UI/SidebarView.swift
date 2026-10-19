@@ -65,9 +65,7 @@ private struct ProfileButton: View {
             onActivate(forceNew)
         } label: {
             ZStack(alignment: .bottomTrailing) {
-                avatar
-                    .frame(width: 36, height: 36)
-                    .clipShape(Circle())
+                ProfileAvatar(profile: profile, size: 36)
                     .overlay(
                         Circle()
                             .stroke(isActive ? Color.accentColor : Color.white.opacity(0.15), lineWidth: isActive ? 2 : 1)
@@ -137,23 +135,6 @@ private struct ProfileButton: View {
             lines.append("⌃⌥\(index + 1)")
         }
         return lines.joined(separator: "\n")
-    }
-
-    @ViewBuilder
-    private var avatar: some View {
-        if let path = profile.avatarPath,
-           let image = NSImage(contentsOf: path) {
-            Image(nsImage: image)
-                .resizable()
-                .scaledToFill()
-        } else {
-            ZStack {
-                Circle().fill(Color(nsColor: profile.highlightColor))
-                Text(profile.monogram)
-                    .font(.system(size: 12, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white)
-            }
-        }
     }
 
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
