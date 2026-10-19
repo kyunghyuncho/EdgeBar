@@ -53,14 +53,22 @@ final class URLPickerPanel: NSPanel {
 
     func present(profileCount: Int, near mouse: NSPoint? = nil) {
         let width: CGFloat = 360
-        let rowHeight: CGFloat = 52
-        let chrome: CGFloat = 72
-        let height = min(max(chrome + CGFloat(max(profileCount, 1)) * rowHeight, 140), 480)
-        let size = NSSize(width: width, height: height)
+        // Match URLPickerView: outer padding + title + URL + spacings + footer,
+        // plus per-row height (avatar + vertical padding) and inter-row spacing.
+        let count = max(profileCount, 1)
+        let chrome: CGFloat = 130
+        let rowHeight: CGFloat = 56
+        let rowSpacing: CGFloat = 4
+        let ideal = chrome
+            + CGFloat(count) * rowHeight
+            + CGFloat(max(count - 1, 0)) * rowSpacing
 
         let anchor = mouse ?? NSEvent.mouseLocation
         let screen = NSScreen.screens.first { NSMouseInRect(anchor, $0.frame, false) } ?? NSScreen.main
         let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 800, height: 600)
+        // Prefer fitting all profiles; only scroll when taller than ~92% of the screen.
+        let height = min(max(ideal, 180), max(visible.height * 0.92, 180))
+        let size = NSSize(width: width, height: height)
 
         var origin = NSPoint(
             x: anchor.x - size.width / 2,
