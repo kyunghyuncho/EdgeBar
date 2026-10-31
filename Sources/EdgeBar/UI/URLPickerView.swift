@@ -4,6 +4,7 @@ import SwiftUI
 struct URLPickerView: View {
     let urlString: String
     let profiles: [EdgeProfile]
+    @ObservedObject var icons: ProfileIconStore
     let onSelect: (EdgeProfile) -> Void
     let onCancel: () -> Void
 
@@ -46,7 +47,7 @@ struct URLPickerView: View {
                                 } label: {
                                     HStack(spacing: 12) {
                                         ZStack(alignment: .bottomTrailing) {
-                                            ProfileAvatar(profile: profile, size: 36)
+                                            ProfileAvatar(icon: icons.icon(for: profile.directoryName), size: 36)
                                                 .overlay(
                                                     Circle()
                                                         .stroke(Color.white.opacity(0.15), lineWidth: 1)

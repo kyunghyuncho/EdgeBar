@@ -204,4 +204,5 @@ enum PreferencesKeys {
     static let manualWindowIDs = "edgebar.manualWindowIDs"
     /// Windows EdgeBar itself minimized while switching away from their profile.
     static let workspaceHiddenWindowIDs = "edgebar.workspaceHiddenWindowIDs"
+    static let profileIcons = "edgebar.profileIcons"
 }
