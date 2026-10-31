@@ -22,7 +22,7 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 ## Behaviour
 
 - Profiles are read from `~/Library/Application Support/Microsoft Edge/Local State` and refreshed when that directory changes.
-- Activating a profile raises that profile’s existing Edge window by matching live window bounds to each profile’s saved `browser.window_placement` (then raising via AppleScript). A new window is spawned only when none match. macOS may prompt once to allow EdgeBar to control Microsoft Edge.
+- Activating a profile shows that profile’s workspace. Windows EdgeBar previously minimized for it are restored, the last-focused one is raised, and windows bound to every other profile are minimized. A window EdgeBar cannot attribute to a profile is left alone. A window opened while a profile is in front joins that profile, so one profile can own several windows. A new window is spawned only when the profile has none, or on Shift-click, ⌘-click, or middle-click. A window you minimize yourself stays minimized when you return, unless it is the only window of that profile. macOS may prompt once to allow EdgeBar to control Microsoft Edge.
 - Global shortcuts: `⌃⌥1`–`⌃⌥9`.
 - Menu bar item toggles Edge-aware auto-hide vs always visible, and left/right docking.
 - Drag a URL onto a profile avatar to open it in that profile.
@@ -39,7 +39,7 @@ Drag-to-avatar and “Open Clipboard URL” still open immediately in the chosen
 
 ## Window matching tip
 
-Edge remembers each profile’s window position in `Preferences` (`browser.window_placement`). EdgeBar matches those rectangles to open windows (unique exact geometry only), so focusing does not depend on title-bar profile names. Right-click **Bind Frontmost Edge Window** to pin a window that placement cannot identify (e.g. a second window for the same profile); manual binds survive rematching. Shift/⌘-click (or middle-click) still force-opens a new window. Allow **Automation** for EdgeBar → Microsoft Edge on first use.
+Edge remembers one rectangle per profile in `Preferences` (`browser.window_placement`). EdgeBar uses a unique exact match to identify an unbound window, then keeps that binding. Further windows of the same profile are remembered as a set: each new window inherits the profile of the front window, or of the EdgeBar action that spawned it. Right-click **Bind Frontmost Edge Window** to pin a window placement cannot identify; a manual bind is never overwritten by geometry. Allow **Automation** for EdgeBar → Microsoft Edge on first use.
 
 ## Architecture
 
