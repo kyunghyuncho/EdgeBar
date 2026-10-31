@@ -13,12 +13,12 @@ struct ProfileAvatar: View {
 }
 
 enum SidebarMetrics {
-    static let width: CGFloat = 208
-    static let iconSize: CGFloat = 34
-    static let rowHeight: CGFloat = 46
-    static let rowSpacing: CGFloat = 4
-    static let verticalPadding: CGFloat = 8
-    static let horizontalPadding: CGFloat = 8
+    static let width: CGFloat = 168
+    static let iconSize: CGFloat = 30
+    static let rowHeight: CGFloat = 42
+    static let rowSpacing: CGFloat = 2
+    static let verticalPadding: CGFloat = 6
+    static let horizontalPadding: CGFloat = 6
 
     static func height(profileCount: Int) -> CGFloat {
         let count = max(profileCount, 1)

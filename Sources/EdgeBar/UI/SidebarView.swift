@@ -210,10 +210,12 @@ private struct ProfileButton: View {
 private struct VisualEffectBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let view = NSVisualEffectView()
-        view.material = .hudWindow
+        view.material = .menu
         view.blendingMode = .behindWindow
         view.state = .active
         view.wantsLayer = true
+        // The names and pictures stay fully opaque; only the glass fades.
+        view.alphaValue = 0.78
         return view
     }
 
