@@ -139,7 +139,7 @@ final class EdgeController: ObservableObject {
             return
         }
 
-        let windows = listWindows()
+        let windows = windowsForRefresh()
         rematchFromPlacements(profiles: profiles, windows: windows)
         if let directory = adoptNewWindows(among: windows),
            let profile = profiles.first(where: { $0.directoryName == directory }) {
@@ -430,13 +430,11 @@ final class EdgeController: ObservableObject {
     /// Lists Edge windows through Accessibility and CoreGraphics. Falls back to AppleScript
     /// when Accessibility is unavailable or saved bindings cannot be mapped onto the new ids.
     /// `reuseSnapshot` serves the last listing so a profile click does not pay for another
-    /// full window enumeration. Listings older than a few seconds are refreshed.
+    /// full window enumeration. A full listing asks Edge for every window's bounds and takes
+    /// several hundred milliseconds; a click only needs that when the window count changed.
     private func listWindows(reuseSnapshot: Bool = false) -> [ScriptedWindow] {
-        if reuseSnapshot,
-           !windowSnapshot.isEmpty,
-           CFAbsoluteTimeGetCurrent() - windowSnapshotAt < 4,
-           listedWindowCount() == windowSnapshot.count {
-            return windowSnapshot
+        if reuseSnapshot, let snapshot = snapshotMatchingCount(skipCountIfYoungerThan: 0.75) {
+            return snapshot
         }
         if let axWindows = listViaAccessibility(), !axWindows.isEmpty {
             if bindingsAreCompatible(with: axWindows) || migrateBindings(to: axWindows) {
@@ -448,6 +446,29 @@ final class EdgeController: ObservableObject {
         let scripted = listScriptedWindows()
         remember(scripted)
         return scripted
+    }
+
+    /// The periodic refresh must not run a full listing on the main thread. That listing blocks
+    /// the next click. Recount, and list only when a window was opened or closed, or the
+    /// minimized-state snapshot is old enough to reconcile.
+    private func windowsForRefresh() -> [ScriptedWindow] {
+        if let snapshot = snapshotMatchingCount(maxAge: 8) {
+            return snapshot
+        }
+        return listWindows()
+    }
+
+    /// Returns the cached listing when it still describes the open windows.
+    /// `skipCountIfYoungerThan` avoids the count round-trip immediately after a switch we just applied.
+    private func snapshotMatchingCount(maxAge: CFAbsoluteTime? = nil, skipCountIfYoungerThan: CFAbsoluteTime? = nil) -> [ScriptedWindow]? {
+        guard !windowSnapshot.isEmpty else { return nil }
+        let age = CFAbsoluteTimeGetCurrent() - windowSnapshotAt
+        if let maxAge, age >= maxAge { return nil }
+        if let skipCountIfYoungerThan, age < skipCountIfYoungerThan {
+            return windowSnapshot
+        }
+        guard listedWindowCount() == windowSnapshot.count else { return nil }
+        return windowSnapshot
     }
 
     /// A count is cheap. A full listing is not, so a click reuses the snapshot when nothing was opened or closed.
