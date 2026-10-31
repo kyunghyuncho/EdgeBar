@@ -22,7 +22,7 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 ## Behaviour
 
 - Profiles are read from `~/Library/Application Support/Microsoft Edge/Local State` and refreshed when that directory changes.
-- Activating a profile shows that profile’s workspace. Windows EdgeBar previously minimized for it are restored, the last-focused one is raised, and windows bound to every other profile are minimized. A window EdgeBar cannot attribute to a profile is left alone. A window opened while a profile is in front joins that profile, so one profile can own several windows. A new window is spawned only when the profile has none, or on Shift-click, ⌘-click, or middle-click. A window you minimize yourself stays minimized when you return, unless it is the only window of that profile. macOS may prompt once to allow EdgeBar to control Microsoft Edge.
+- Activating a profile shows that profile’s workspace. Windows EdgeBar previously minimized for it are restored, the last-focused one is raised, and windows bound to every other profile are minimized. The switch reuses the latest window list and applies the change in one step. A window EdgeBar cannot attribute to a profile is left alone. A window opened while a profile is in front joins that profile, so one profile can own several windows. A new window is spawned only when the profile has none, or on Shift-click, ⌘-click, or middle-click. A window you minimize yourself stays minimized when you return, unless it is the only window of that profile. macOS may prompt once to allow EdgeBar to control Microsoft Edge.
 - Global shortcuts: `⌃⌥1`–`⌃⌥9`.
 - Menu bar item toggles Edge-aware auto-hide vs always visible, and left/right docking.
 - Drag a URL onto a profile avatar to open it in that profile.

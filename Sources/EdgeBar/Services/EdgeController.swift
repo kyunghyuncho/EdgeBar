@@ -2,6 +2,9 @@ import AppKit
 import ApplicationServices
 import Foundation
 
+@_silgen_name("_AXUIElementGetWindow")
+private func _AXUIElementGetWindow(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
+
 /// Launches Edge profiles via the Mach-O binary and treats each profile as a workspace.
 ///
 /// Selecting a profile restores windows EdgeBar previously hid for it, raises the last-focused
@@ -58,6 +61,16 @@ final class EdgeController: ObservableObject {
     private var observedFrontDirectory: String?
     private var hasObservedWindows = false
     private var pendingSpawn: PendingSpawn?
+    /// CGWindowID string → Accessibility element from the latest AX listing.
+    private var axWindowElements: [String: AXUIElement] = [:]
+    private var didAttemptBindingMigration = false
+    private var windowSnapshot: [ScriptedWindow] = []
+    private var windowSnapshotAt: CFAbsoluteTime = 0
+    private var cachedListScript: NSAppleScript?
+    private var workspaceScript: NSAppleScript?
+    private var cachedPlacements: [Placement] = []
+    private var placementMtimes: [String: TimeInterval] = [:]
+    private var persistedSignature: String?
 
     @Published private(set) var activeProfileDirectory: String?
 
@@ -109,7 +122,7 @@ final class EdgeController: ObservableObject {
 
     func bindFrontmostEdgeWindow(to profile: EdgeProfile) {
         guard edgeIsRunning else { return }
-        let windows = listScriptedWindows()
+        let windows = listWindows()
         guard let front = windows.filter({ !$0.minimized }).min(by: { $0.index < $1.index })
             ?? windows.min(by: { $0.index < $1.index })
         else { return }
@@ -125,7 +138,7 @@ final class EdgeController: ObservableObject {
             return
         }
 
-        let windows = listScriptedWindows()
+        let windows = listWindows()
         rematchFromPlacements(profiles: profiles, windows: windows)
         if let directory = adoptNewWindows(among: windows),
            let profile = profiles.first(where: { $0.directoryName == directory }) {
@@ -164,7 +177,7 @@ final class EdgeController: ObservableObject {
             pendingSpawn = nil
         }
 
-        let windows = listScriptedWindows()
+        let windows = listWindows(reuseSnapshot: true)
         guard !windows.isEmpty else { return .noWindow }
 
         rematchFromPlacements(profiles: ProfileStore.shared.profiles, windows: windows)
@@ -185,6 +198,7 @@ final class EdgeController: ObservableObject {
             guard applyWindowWorkspace(minimize: minimizeIDs, restore: [], raise: nil) else {
                 return .failed
             }
+            updateSnapshot(minimize: minimizeIDs, restore: [], raise: nil)
             workspaceHiddenIDs.formUnion(minimizeIDs)
             noteObservation(windows, frontDirectory: observedFrontDirectory)
             persistBindings()
@@ -204,6 +218,7 @@ final class EdgeController: ObservableObject {
         guard applyWindowWorkspace(minimize: minimizeIDs, restore: restoreIDs, raise: raise?.id) else {
             return .failed
         }
+        updateSnapshot(minimize: minimizeIDs, restore: restoreIDs, raise: raise?.id)
 
         workspaceHiddenIDs.formUnion(minimizeIDs)
         workspaceHiddenIDs.subtract(restoreIDs)
@@ -284,7 +299,7 @@ final class EdgeController: ObservableObject {
     /// Unique geometry claims unbound windows only. Existing and manual bindings stay.
     private func rematchFromPlacements(profiles: [EdgeProfile], windows: [ScriptedWindow]? = nil) {
         let placements = loadPlacements(for: profiles)
-        let windows = windows ?? listScriptedWindows()
+        let windows = windows ?? listWindows()
         guard !windows.isEmpty else { return }
 
         let liveIDs = Set(windows.map(\.id))
@@ -293,6 +308,15 @@ final class EdgeController: ObservableObject {
         workspaceHiddenIDs = workspaceHiddenIDs.intersection(liveIDs)
         let revealed = Set(windows.filter { !$0.minimized }.map(\.id))
         workspaceHiddenIDs.subtract(revealed)
+
+        let needsGeometry = windows.contains { windowBindings[$0.id] == nil && $0.bounds.width > 1 }
+        guard needsGeometry else {
+            lastWindowByProfile = lastWindowByProfile.filter { directory, id in
+                liveIDs.contains(id) && windowBindings[id] == directory
+            }
+            persistBindings()
+            return
+        }
 
         var claimed = Set<String>()
         let ordered = placements.sorted { lhs, rhs in
@@ -333,6 +357,26 @@ final class EdgeController: ObservableObject {
     private func loadPlacements(for profiles: [EdgeProfile]) -> [Placement] {
         let support = FileManager.default.homeDirectoryForCurrentUser
             .appendingPathComponent("Library/Application Support/Microsoft Edge", isDirectory: true)
+        var stamp: [String: TimeInterval] = [:]
+        var changed = cachedPlacements.isEmpty
+        for profile in profiles {
+            let prefsURL = support
+                .appendingPathComponent(profile.directoryName, isDirectory: true)
+                .appendingPathComponent("Preferences")
+            let mtime = (try? prefsURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate)?
+                .timeIntervalSince1970 ?? -1
+            stamp[profile.directoryName] = mtime
+            if placementMtimes[profile.directoryName] != mtime {
+                changed = true
+            }
+        }
+        if placementMtimes.count != stamp.count {
+            changed = true
+        }
+        if !changed {
+            return cachedPlacements
+        }
+
         var result: [Placement] = []
         for profile in profiles {
             let prefsURL = support
@@ -364,6 +408,8 @@ final class EdgeController: ObservableObject {
                 )
             )
         }
+        cachedPlacements = result
+        placementMtimes = stamp
         return result
     }
 
@@ -376,6 +422,256 @@ final class EdgeController: ObservableObject {
 
     private static func boundsDistance(_ a: NSRect, _ b: NSRect) -> CGFloat {
         abs(a.minX - b.minX) + abs(a.minY - b.minY) + abs(a.maxX - b.maxX) + abs(a.maxY - b.maxY)
+    }
+
+    // MARK: - Accessibility (fast path)
+
+    /// Lists Edge windows through Accessibility and CoreGraphics. Falls back to AppleScript
+    /// when Accessibility is unavailable or saved bindings cannot be mapped onto the new ids.
+    /// `reuseSnapshot` serves the last listing so a profile click does not pay for another
+    /// full window enumeration. Listings older than a few seconds are refreshed.
+    private func listWindows(reuseSnapshot: Bool = false) -> [ScriptedWindow] {
+        if reuseSnapshot,
+           !windowSnapshot.isEmpty,
+           CFAbsoluteTimeGetCurrent() - windowSnapshotAt < 4 {
+            return windowSnapshot
+        }
+        if let axWindows = listViaAccessibility(), !axWindows.isEmpty {
+            if bindingsAreCompatible(with: axWindows) || migrateBindings(to: axWindows) {
+                remember(axWindows)
+                return axWindows
+            }
+        }
+        axWindowElements.removeAll()
+        let scripted = listScriptedWindows()
+        remember(scripted)
+        return scripted
+    }
+
+    private func remember(_ windows: [ScriptedWindow]) {
+        windowSnapshot = windows
+        windowSnapshotAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    private func updateSnapshot(minimize: [String], restore: [String], raise: String?) {
+        let minimizeSet = Set(minimize)
+        let restoreSet = Set(restore)
+        windowSnapshot = windowSnapshot.map { window in
+            let minimized: Bool
+            if window.id == raise || restoreSet.contains(window.id) {
+                minimized = false
+            } else if minimizeSet.contains(window.id) {
+                minimized = true
+            } else {
+                minimized = window.minimized
+            }
+            return ScriptedWindow(
+                id: window.id,
+                index: window.id == raise ? 0 : window.index,
+                bounds: window.bounds,
+                minimized: minimized,
+                minimizable: window.minimizable
+            )
+        }
+        windowSnapshotAt = CFAbsoluteTimeGetCurrent()
+    }
+
+    private func bindingsAreCompatible(with windows: [ScriptedWindow]) -> Bool {
+        let live = Set(windows.map(\.id))
+        let referenced = Set(windowBindings.keys)
+            .union(manualWindowIDs)
+            .union(workspaceHiddenIDs)
+            .union(Set(lastWindowByProfile.values))
+        if referenced.isEmpty { return true }
+        return referenced.contains(where: live.contains)
+    }
+
+    /// Rewrites AppleScript window ids to CGWindowIDs by matching bounds once.
+    private func migrateBindings(to axWindows: [ScriptedWindow]) -> Bool {
+        guard !didAttemptBindingMigration else { return false }
+        let scripted = listScriptedWindows()
+        guard !scripted.isEmpty else { return false }
+        didAttemptBindingMigration = true
+
+        let liveAX = Set(axWindows.map(\.id))
+        var used = Set<String>()
+        var mapped: [String: String] = [:]
+
+        func remap(_ old: String) -> String? {
+            if let existing = mapped[old] { return existing }
+            let resolved: String?
+            if liveAX.contains(old) {
+                resolved = old
+            } else if let previous = scripted.first(where: { $0.id == old }),
+                      previous.bounds.width > 1 {
+                let hits = axWindows.filter {
+                    !used.contains($0.id)
+                        && Self.boundsEqual($0.bounds, previous.bounds, tolerance: Self.placementTolerance)
+                }
+                if hits.count == 1, let hit = hits.first {
+                    used.insert(hit.id)
+                    resolved = hit.id
+                } else {
+                    resolved = nil
+                }
+            } else {
+                resolved = nil
+            }
+            if let resolved {
+                mapped[old] = resolved
+            }
+            return resolved
+        }
+
+        var failed = false
+        var newBindings: [String: String] = [:]
+        for (old, directory) in windowBindings {
+            if let neu = remap(old) {
+                newBindings[neu] = directory
+            } else if scripted.contains(where: { $0.id == old }) {
+                failed = true
+            }
+        }
+        guard !failed else { return false }
+
+        var newManual = Set<String>()
+        for id in manualWindowIDs {
+            if let neu = remap(id) { newManual.insert(neu) }
+        }
+        var newHidden = Set<String>()
+        for id in workspaceHiddenIDs {
+            if let neu = remap(id) { newHidden.insert(neu) }
+        }
+        var newLast: [String: String] = [:]
+        for (directory, id) in lastWindowByProfile {
+            if let neu = remap(id) { newLast[directory] = neu }
+        }
+
+        windowBindings = newBindings
+        manualWindowIDs = newManual
+        workspaceHiddenIDs = newHidden
+        lastWindowByProfile = newLast
+        persistBindings()
+        return true
+    }
+
+    private func listViaAccessibility() -> [ScriptedWindow]? {
+        guard AXIsProcessTrusted(), let running = edgeRunningApp() else { return nil }
+        let appElement = AXUIElementCreateApplication(running.processIdentifier)
+        AXUIElementSetMessagingTimeout(appElement, 0.3)
+        var raw: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &raw) == .success,
+              let elements = raw as? [AXUIElement],
+              !elements.isEmpty
+        else { return nil }
+
+        let cgBounds = cgWindowBounds(pid: running.processIdentifier)
+        var windows: [ScriptedWindow] = []
+        var elementsByID: [String: AXUIElement] = [:]
+        for (offset, element) in elements.enumerated() {
+            var role: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+            guard (role as? String) == (kAXWindowRole as String) else { continue }
+
+            var windowID: CGWindowID = 0
+            guard _AXUIElementGetWindow(element, &windowID) == .success, windowID != 0 else { continue }
+            let id = String(windowID)
+            var minimizedRef: CFTypeRef?
+            AXUIElementCopyAttributeValue(element, kAXMinimizedAttribute as CFString, &minimizedRef)
+            var settable = DarwinBoolean(false)
+            AXUIElementIsAttributeSettable(element, kAXMinimizedAttribute as CFString, &settable)
+            let bounds = cgBounds[windowID] ?? .zero
+            windows.append(
+                ScriptedWindow(
+                    id: id,
+                    index: offset + 1,
+                    bounds: bounds,
+                    minimized: (minimizedRef as? Bool) ?? false,
+                    minimizable: settable.boolValue
+                )
+            )
+            elementsByID[id] = element
+        }
+        guard !windows.isEmpty else { return nil }
+        axWindowElements = elementsByID
+        return windows
+    }
+
+    private func cgWindowBounds(pid: pid_t) -> [CGWindowID: NSRect] {
+        guard let info = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]
+        else { return [:] }
+        var result: [CGWindowID: NSRect] = [:]
+        for entry in info {
+            guard Self.pidValue(entry[kCGWindowOwnerPID as String]) == pid,
+                  let windowID = Self.cgWindowID(entry[kCGWindowNumber as String]),
+                  let bounds = Self.cgRect(entry[kCGWindowBounds as String])
+            else { continue }
+            result[windowID] = bounds
+        }
+        return result
+    }
+
+    private static func pidValue(_ raw: Any?) -> pid_t? {
+        switch raw {
+        case let value as NSNumber:
+            return pid_t(value.int32Value)
+        case let value as Int32:
+            return value
+        case let value as Int:
+            return pid_t(value)
+        default:
+            return nil
+        }
+    }
+
+    private static func cgWindowID(_ raw: Any?) -> CGWindowID? {
+        switch raw {
+        case let value as NSNumber:
+            return CGWindowID(value.uint32Value)
+        case let value as UInt32:
+            return value
+        case let value as Int:
+            return CGWindowID(value)
+        default:
+            return nil
+        }
+    }
+
+    private static func cgRect(_ raw: Any?) -> NSRect? {
+        let dict = raw as? NSDictionary
+        func num(_ key: String) -> CGFloat? {
+            if let value = dict?[key] as? NSNumber { return CGFloat(truncating: value) }
+            return nil
+        }
+        guard let x = num("X"), let y = num("Y"), let width = num("Width"), let height = num("Height"),
+              width > 1, height > 1
+        else { return nil }
+        return NSRect(x: x, y: y, width: width, height: height)
+    }
+
+    private func applyViaAccessibility(minimize: [String], restore: [String], raise: String?) -> Bool {
+        let needed = minimize + restore + (raise.map { [$0] } ?? [])
+        guard !axWindowElements.isEmpty, needed.allSatisfy({ axWindowElements[$0] != nil }) else { return false }
+        edgeRunningApp()?.activate()
+        var ok = true
+        for id in restore {
+            ok = setMinimized(false, id: id) && ok
+        }
+        if let raise, let element = axWindowElements[raise] {
+            ok = setMinimized(false, id: raise) && ok
+            ok = AXUIElementPerformAction(element, kAXRaiseAction as CFString) == .success && ok
+            AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, kCFBooleanTrue)
+        }
+        for id in minimize {
+            ok = setMinimized(true, id: id) && ok
+        }
+        return ok
+    }
+
+    private func setMinimized(_ minimized: Bool, id: String) -> Bool {
+        guard let element = axWindowElements[id] else { return false }
+        let value: CFBoolean = minimized ? kCFBooleanTrue : kCFBooleanFalse
+        return AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, value) == .success
     }
 
     // MARK: - AppleScript bridge
@@ -402,7 +698,7 @@ final class EdgeController: ObservableObject {
           return out
         end tell
         """
-        guard let output = runAppleScript(source)?.trimmingCharacters(in: .whitespacesAndNewlines),
+        guard let output = runCachedListScript(source)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !output.isEmpty
         else { return [] }
 
@@ -440,42 +736,75 @@ final class EdgeController: ObservableObject {
 
     private func applyWindowWorkspace(minimize: [String], restore: [String], raise: String?) -> Bool {
         guard edgeIsRunning else { return false }
-
-        func guarded(_ statements: [String]) -> String {
-            statements.map { statement in
-                """
-                try
-                  \(statement)
-                end try
-                """
-            }.joined(separator: "\n")
+        if applyViaAccessibility(minimize: minimize, restore: restore, raise: raise) {
+            return true
         }
+        return applyViaScript(minimize: minimize, restore: restore, raise: raise)
+    }
 
-        let minimizeLines = guarded(minimize.map {
-            "set minimized of window id \"\(Self.escapeAppleScript($0))\" to true"
-        })
-        let restoreLines = guarded(restore.map {
-            "set minimized of window id \"\(Self.escapeAppleScript($0))\" to false"
-        })
-        let raiseLines: String
-        if let raise {
-            raiseLines = guarded([
-                "set index of window id \"\(Self.escapeAppleScript(raise))\" to 1"
-            ])
-        } else {
-            raiseLines = ""
-        }
+    /// One compiled handler. Rebuilding an AppleScript per click costs more than the window change itself.
+    private func applyViaScript(minimize: [String], restore: [String], raise: String?) -> Bool {
+        guard let script = workspaceHandler() else { return false }
+        edgeRunningApp()?.activate()
+        let separator = String(UnicodeScalar(30)!)
+        let event = NSAppleEventDescriptor(
+            eventClass: AEEventClass(0x61736372),
+            eventID: AEEventID(0x70736272),
+            targetDescriptor: nil,
+            returnID: AEReturnID(kAutoGenerateReturnID),
+            transactionID: AETransactionID(kAnyTransactionID)
+        )
+        event.setDescriptor(NSAppleEventDescriptor(string: "applyWorkspace"), forKeyword: AEKeyword(0x736E616D))
+        let params = NSAppleEventDescriptor.list()
+        params.insert(NSAppleEventDescriptor(string: minimize.joined(separator: separator)), at: 1)
+        params.insert(NSAppleEventDescriptor(string: restore.joined(separator: separator)), at: 2)
+        params.insert(NSAppleEventDescriptor(string: raise ?? ""), at: 3)
+        event.setDescriptor(params, forKeyword: keyDirectObject)
+        var error: NSDictionary?
+        let result = script.executeAppleEvent(event, error: &error)
+        return error == nil && result.stringValue == "ok"
+    }
 
+    private func workspaceHandler() -> NSAppleScript? {
+        if let workspaceScript { return workspaceScript }
         let source = """
-        tell application "Microsoft Edge"
-          activate
-          \(minimizeLines)
-          \(restoreLines)
-          \(raiseLines)
+        on applyWorkspace(minimizeText, restoreText, raiseID)
+          set rs to ASCII character 30
+          tell application "Microsoft Edge"
+            if restoreText is not "" then
+              set AppleScript's text item delimiters to rs
+              set ids to text items of restoreText
+              set AppleScript's text item delimiters to ""
+              repeat with wid in ids
+                try
+                  set minimized of window id wid to false
+                end try
+              end repeat
+            end if
+            if raiseID is not "" then
+              try
+                set index of window id raiseID to 1
+              end try
+            end if
+            if minimizeText is not "" then
+              set AppleScript's text item delimiters to rs
+              set ids to text items of minimizeText
+              set AppleScript's text item delimiters to ""
+              repeat with wid in ids
+                try
+                  set minimized of window id wid to true
+                end try
+              end repeat
+            end if
+          end tell
           return "ok"
-        end tell
+        end applyWorkspace
         """
-        return (runAppleScript(source) ?? "") == "ok"
+        guard let script = NSAppleScript(source: source) else { return nil }
+        var error: NSDictionary?
+        _ = script.executeAndReturnError(&error)
+        workspaceScript = script
+        return script
     }
 
     private static func appleScriptBool(_ raw: String) -> Bool {
@@ -483,18 +812,14 @@ final class EdgeController: ObservableObject {
         return value == "true" || value == "yes"
     }
 
-    private static func escapeAppleScript(_ value: String) -> String {
-        value
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-    }
-
-    private func runAppleScript(_ source: String) -> String? {
+    private func runCachedListScript(_ source: String) -> String? {
+        if cachedListScript == nil {
+            cachedListScript = NSAppleScript(source: source)
+        }
         var error: NSDictionary?
-        guard let script = NSAppleScript(source: source) else { return nil }
-        let result = script.executeAndReturnError(&error)
+        let result = cachedListScript?.executeAndReturnError(&error)
         if error != nil { return nil }
-        return result.stringValue
+        return result?.stringValue
     }
 
     // MARK: - Launch
@@ -503,7 +828,7 @@ final class EdgeController: ObservableObject {
         let edgeBinary = URL(fileURLWithPath: Self.edgeBinaryPath)
         guard FileManager.default.isExecutableFile(atPath: edgeBinary.path) else { return }
 
-        let existingIDs = Set(listScriptedWindows().map(\.id))
+        let existingIDs = Set(listWindows().map(\.id))
         let pending = PendingSpawn(
             token: UUID(),
             directoryName: profile.directoryName,
@@ -539,7 +864,7 @@ final class EdgeController: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
             guard let self, self.edgeIsRunning else { return }
             guard self.pendingSpawn?.token == pending.token else { return }
-            let windows = self.listScriptedWindows()
+            let windows = self.listWindows()
             self.rematchFromPlacements(profiles: ProfileStore.shared.profiles, windows: windows)
 
             let fresh = windows.filter { !pending.excluding.contains($0.id) }
@@ -589,10 +914,18 @@ final class EdgeController: ObservableObject {
     }
 
     private func persistBindings() {
+        let signature = [
+            windowBindings.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n"),
+            lastWindowByProfile.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: "\n"),
+            manualWindowIDs.sorted().joined(separator: "\n"),
+            workspaceHiddenIDs.sorted().joined(separator: "\n"),
+        ].joined(separator: "\n--\n")
+        guard signature != persistedSignature else { return }
         UserDefaults.standard.set(windowBindings, forKey: PreferencesKeys.windowBindings)
         UserDefaults.standard.set(lastWindowByProfile, forKey: PreferencesKeys.lastWindowByProfile)
         UserDefaults.standard.set(Array(manualWindowIDs), forKey: PreferencesKeys.manualWindowIDs)
         UserDefaults.standard.set(Array(workspaceHiddenIDs), forKey: PreferencesKeys.workspaceHiddenWindowIDs)
+        persistedSignature = signature
     }
 
     private func loadPersistedBindings() {
@@ -608,6 +941,8 @@ final class EdgeController: ObservableObject {
         if let raw = UserDefaults.standard.array(forKey: PreferencesKeys.workspaceHiddenWindowIDs) as? [String] {
             workspaceHiddenIDs = Set(raw)
         }
+        persistedSignature = nil
+        persistBindings()
     }
 
     private func edgeRunningApp() -> NSRunningApplication? {
