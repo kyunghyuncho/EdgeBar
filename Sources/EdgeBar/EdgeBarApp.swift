@@ -19,6 +19,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var panel: FloatingSidebarPanel?
     private var urlPickerPanel: URLPickerPanel?
+    private var iconPickerPanel: IconPickerPanel?
     private var pendingPickerURL: String?
     private var cancellables = Set<AnyCancellable>()
     private var hotKeyRefs: [EventHotKeyRef?] = []
@@ -112,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             URLPickerView(
                 urlString: urlString,
                 profiles: store.profiles,
+                icons: ProfileIconStore.shared,
                 onSelect: { [weak self] profile in
                     self?.selectPickerProfile(profile)
                 },
@@ -345,9 +347,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupPanel() {
         let panel = FloatingSidebarPanel(contentRect: NSRect(x: 0, y: 0, width: 56, height: 200))
-        panel.host(
-            SidebarView(store: store, controller: controller, focus: focus)
-        )
+        panel.host(sidebarView())
         self.panel = panel
         panel.orderFrontRegardless()
     }
@@ -355,7 +355,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func bindPublishers() {
         store.$profiles
             .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
+            .sink { [weak self] profiles in
+                ProfileIconStore.shared.ensureIcons(for: profiles.map(\.directoryName))
                 self?.rebuildMenu()
                 self?.relayoutPanel()
                 self?.controller.refreshActiveProfile(from: self?.store.profiles ?? [])
@@ -377,7 +378,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
 
-        Timer.publish(every: 1.0, on: .main, in: .common)
+        Timer.publish(every: 3.0, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
                 guard let self else { return }
@@ -393,7 +394,56 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             screen: NSScreen.main
         )
         // Re-host so SwiftUI reflects new height.
-        panel?.host(SidebarView(store: store, controller: controller, focus: focus))
+        panel?.host(sidebarView())
+    }
+
+    private func sidebarView() -> SidebarView {
+        SidebarView(
+            store: store,
+            controller: controller,
+            focus: focus,
+            icons: ProfileIconStore.shared,
+            onPickIcon: { [weak self] profile in
+                self?.presentIconPicker(for: profile)
+            }
+        )
+    }
+
+    private func presentIconPicker(for profile: EdgeProfile) {
+        guard let panel else { return }
+        let picker = iconPickerPanel ?? IconPickerPanel()
+        // The context menu is still resigning key. Attach dismissal only after the picker is up.
+        picker.onDismiss = nil
+        let icon = ProfileIconStore.shared.icon(for: profile.directoryName)
+        picker.host(
+            IconPickerView(
+                profileName: profile.displayName,
+                selectedID: icon.id,
+                onSelect: { [weak self] chosen in
+                    ProfileIconStore.shared.setIcon(chosen, for: profile.directoryName)
+                    self?.dismissIconPicker()
+                },
+                onCancel: { [weak self] in
+                    self?.dismissIconPicker()
+                }
+            )
+        )
+        iconPickerPanel = picker
+        let anchor: NSPoint
+        if focus.dockSide == .right {
+            anchor = NSPoint(x: panel.frame.minX - 332 - 8, y: panel.frame.midY)
+        } else {
+            anchor = NSPoint(x: panel.frame.maxX + 8, y: panel.frame.midY)
+        }
+        picker.present(near: anchor)
+        DispatchQueue.main.async { [weak picker, weak self] in
+            picker?.onDismiss = { self?.dismissIconPicker() }
+        }
+    }
+
+    private func dismissIconPicker() {
+        iconPickerPanel?.onDismiss = nil
+        iconPickerPanel?.dismiss()
     }
 
     private func applyVisibility(animated: Bool = true) {
@@ -489,11 +539,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let panel, panel.frame.contains(screenPoint) else { return }
         // Map Y within panel to profile index.
         let localY = screenPoint.y - panel.frame.minY
-        let padding: CGFloat = 10
-        let rowHeight: CGFloat = 48
-        let fromTop = panel.frame.height - localY - padding
-        let index = Int(fromTop / rowHeight)
-        guard index >= 0, index < store.profiles.count else { return }
+        guard let index = SidebarMetrics.index(
+            localY: localY,
+            panelHeight: panel.frame.height,
+            count: store.profiles.count
+        ) else { return }
         controller.activate(profile: store.profiles[index], forceNewWindow: true)
     }
 }

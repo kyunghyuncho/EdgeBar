@@ -65,10 +65,8 @@ final class FloatingSidebarPanel: NSPanel {
     func layoutForProfiles(count: Int, dockSide: DockSide, screen: NSScreen?) {
         guard let screen else { return }
         let visible = screen.visibleFrame
-        let width: CGFloat = 56
-        let rowHeight: CGFloat = 48
-        let padding: CGFloat = 12
-        let height = max(CGFloat(count) * rowHeight + padding * 2, 72)
+        let width = SidebarMetrics.width
+        let height = SidebarMetrics.height(profileCount: count)
 
         let defaults = UserDefaults.standard
         let hasSaved = defaults.object(forKey: PreferencesKeys.panelOriginX) != nil
@@ -89,6 +87,9 @@ final class FloatingSidebarPanel: NSPanel {
             let y = visible.midY - height / 2
             origin = NSPoint(x: x, y: y)
         }
+
+        origin.x = min(max(origin.x, visible.minX + 4), visible.maxX - width - 4)
+        origin.y = min(max(origin.y, visible.minY + 4), visible.maxY - height - 4)
 
         setFrame(NSRect(origin: origin, size: NSSize(width: width, height: height)), display: true)
     }
