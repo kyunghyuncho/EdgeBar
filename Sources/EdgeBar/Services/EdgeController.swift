@@ -67,6 +67,7 @@ final class EdgeController: ObservableObject {
     private var windowSnapshot: [ScriptedWindow] = []
     private var windowSnapshotAt: CFAbsoluteTime = 0
     private var cachedListScript: NSAppleScript?
+    private var cachedCountScript: NSAppleScript?
     private var workspaceScript: NSAppleScript?
     private var cachedPlacements: [Placement] = []
     private var placementMtimes: [String: TimeInterval] = [:]
@@ -433,7 +434,8 @@ final class EdgeController: ObservableObject {
     private func listWindows(reuseSnapshot: Bool = false) -> [ScriptedWindow] {
         if reuseSnapshot,
            !windowSnapshot.isEmpty,
-           CFAbsoluteTimeGetCurrent() - windowSnapshotAt < 4 {
+           CFAbsoluteTimeGetCurrent() - windowSnapshotAt < 4,
+           listedWindowCount() == windowSnapshot.count {
             return windowSnapshot
         }
         if let axWindows = listViaAccessibility(), !axWindows.isEmpty {
@@ -446,6 +448,22 @@ final class EdgeController: ObservableObject {
         let scripted = listScriptedWindows()
         remember(scripted)
         return scripted
+    }
+
+    /// A count is cheap. A full listing is not, so a click reuses the snapshot when nothing was opened or closed.
+    private func listedWindowCount() -> Int? {
+        guard edgeIsRunning else { return nil }
+        if cachedCountScript == nil {
+            cachedCountScript = NSAppleScript(source: """
+            tell application "Microsoft Edge"
+              count of windows
+            end tell
+            """)
+        }
+        var error: NSDictionary?
+        guard let result = cachedCountScript?.executeAndReturnError(&error), error == nil else { return nil }
+        if let text = result.stringValue, let count = Int(text) { return count }
+        return Int(result.int32Value)
     }
 
     private func remember(_ windows: [ScriptedWindow]) {
