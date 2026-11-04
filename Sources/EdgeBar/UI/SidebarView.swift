@@ -14,43 +14,101 @@ struct SidebarView: View {
             VisualEffectBackground()
                 .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
 
-            VStack(spacing: SidebarMetrics.rowSpacing) {
-                if store.profiles.isEmpty {
-                    Text("—")
-                        .font(.system(size: 11, weight: .medium, design: .rounded))
-                        .foregroundStyle(.secondary)
-                        .help(store.lastError ?? "No Edge profiles found")
-                        .frame(height: SidebarMetrics.rowHeight)
-                } else {
-                    ForEach(Array(store.profiles.enumerated()), id: \.element.id) { index, profile in
-                        ProfileButton(
-                            profile: profile,
-                            icon: icons.icon(for: profile.directoryName),
-                            index: index,
-                            isActive: controller.activeProfileDirectory == profile.directoryName,
-                            onActivate: { forceNew in
-                                controller.activate(profile: profile, forceNewWindow: forceNew)
-                            },
-                            onOpenURL: { url in
-                                controller.open(url: url, in: profile)
-                            },
-                            onBindWindow: {
-                                controller.bindFrontmostEdgeWindow(to: profile)
-                            },
-                            onOpenClipboard: {
-                                controller.openClipboardURL(in: profile)
-                            },
-                            onPickIcon: {
-                                onPickIcon(profile)
-                            }
-                        )
+            VStack(spacing: 0) {
+                DragHandleBar()
+                VStack(spacing: SidebarMetrics.rowSpacing) {
+                    if store.profiles.isEmpty {
+                        Text("—")
+                            .font(.system(size: 11, weight: .medium, design: .rounded))
+                            .foregroundStyle(.secondary)
+                            .help(store.lastError ?? "No Edge profiles found")
+                            .frame(height: SidebarMetrics.rowHeight)
+                    } else {
+                        ForEach(Array(store.profiles.enumerated()), id: \.element.id) { index, profile in
+                            ProfileButton(
+                                profile: profile,
+                                icon: icons.icon(for: profile.directoryName),
+                                index: index,
+                                isActive: controller.activeProfileDirectory == profile.directoryName,
+                                onActivate: { forceNew in
+                                    controller.activate(profile: profile, forceNewWindow: forceNew)
+                                },
+                                onOpenURL: { url in
+                                    controller.open(url: url, in: profile)
+                                },
+                                onBindWindow: {
+                                    controller.bindFrontmostEdgeWindow(to: profile)
+                                },
+                                onOpenClipboard: {
+                                    controller.openClipboardURL(in: profile)
+                                },
+                                onPickIcon: {
+                                    onPickIcon(profile)
+                                }
+                            )
+                        }
                     }
                 }
+                .padding(.vertical, SidebarMetrics.verticalPadding)
+                .padding(.horizontal, SidebarMetrics.horizontalPadding)
             }
-            .padding(.vertical, SidebarMetrics.verticalPadding)
-            .padding(.horizontal, SidebarMetrics.horizontalPadding)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Narrow strip above the profiles. Mouse-downs here drag the panel and never hit a row.
+private struct DragHandleBar: View {
+    var body: some View {
+        ZStack {
+            Color.primary.opacity(0.07)
+            VStack(spacing: 0) {
+                ZStack {
+                    Capsule()
+                        .fill(Color.primary.opacity(0.45))
+                        .frame(width: 36, height: 3)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Rectangle()
+                    .fill(Color.primary.opacity(0.16))
+                    .frame(height: 1)
+            }
+            WindowDragArea()
+        }
+        .frame(height: SidebarMetrics.dragHandleHeight)
+        .frame(maxWidth: .infinity)
+        .clipShape(
+            UnevenRoundedRectangle(
+                topLeadingRadius: 14,
+                bottomLeadingRadius: 0,
+                bottomTrailingRadius: 0,
+                topTrailingRadius: 14,
+                style: .continuous
+            )
+        )
+        .help("Drag to move")
+    }
+}
+
+private struct WindowDragArea: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowDragAreaView {
+        WindowDragAreaView()
+    }
+
+    func updateNSView(_ nsView: WindowDragAreaView, context: Context) {}
+}
+
+private final class WindowDragAreaView: NSView {
+    override var mouseDownCanMoveWindow: Bool { true }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.performDrag(with: event)
+    }
+
+    override func resetCursorRects() {
+        addCursorRect(bounds, cursor: .openHand)
     }
 }
 
