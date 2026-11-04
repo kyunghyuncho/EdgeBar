@@ -28,6 +28,7 @@ The bundle script runs `swift build -c release`, assembles `build/EdgeBar.app`, 
 - The sidebar shows each profile’s name and a picture. A profile with no picture receives a random one. Right-click a row and choose **Change Icon…** to pick another, from the same kind of grid macOS uses for account pictures.
 - Menu bar item toggles Edge-aware auto-hide vs always visible, and left/right docking.
 - Drag a URL onto a profile avatar to open it in that profile.
+- A narrow grip along the top of the sidebar moves the panel. Profile rows stay click targets, so a drag that starts on a row does not switch windows.
 
 ### Default browser and link clicks
 

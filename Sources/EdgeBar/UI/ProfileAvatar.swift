@@ -19,17 +19,20 @@ enum SidebarMetrics {
     static let rowSpacing: CGFloat = 2
     static let verticalPadding: CGFloat = 6
     static let horizontalPadding: CGFloat = 6
+    /// Grip along the top of the panel. Clicks here move the window and never activate a profile.
+    static let dragHandleHeight: CGFloat = 16
 
     static func height(profileCount: Int) -> CGFloat {
         let count = max(profileCount, 1)
-        return verticalPadding * 2
+        return dragHandleHeight
+            + verticalPadding * 2
             + CGFloat(count) * rowHeight
             + CGFloat(max(count - 1, 0)) * rowSpacing
     }
 
     /// Index of the row under a point measured from the panel's bottom-left, in screen coordinates' Y.
     static func index(localY: CGFloat, panelHeight: CGFloat, count: Int) -> Int? {
-        let fromTop = panelHeight - localY - verticalPadding
+        let fromTop = panelHeight - localY - dragHandleHeight - verticalPadding
         guard fromTop >= 0, count > 0 else { return nil }
         let stride = rowHeight + rowSpacing
         let index = Int(fromTop / stride)
